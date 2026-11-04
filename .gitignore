@@ -1,0 +1,7 @@
+opca.sqlite3
+opca.sqlite3-shm
+opca.sqlite3-wal
+opca-data/
+cards/
+__pycache__/
+*.py[cod]
