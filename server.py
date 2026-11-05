@@ -32,8 +32,27 @@ PUBLIC_CARD_DIR = Path(os.environ.get("OPCA_CARD_DIR", BASE_DIR / "cards"))
 ADMIN_USERNAME = "찍찍이".casefold()
 USERNAME_RE = re.compile(r"^[A-Za-z0-9가-힣_.-]{3,24}$")
 CARD_IMAGE_PATH_RE = re.compile(r"^/cards/[a-f0-9]{32}\.(?:jpg|png|webp)$")
-NICKNAME_ADJECTIVES = ["데굴데굴", "냠냠쩝쩝", "우당당탕", "세상단단", "말랑폭신", "빙글빙글", "반짝반짝"]
-HERO_NAMES = ["준킹볼", "디바", "겐지", "메르시", "루시우", "키리코", "아나", "라인하르트", "트레이서", "솜브라", "위도우"]
+OPCA_NICKNAME_BASES = [
+    "\ub370\uad74\ub370\uad74 \uc900\ud0b9\ubcfc",
+    "\ub0e0\ub0e0\uca5d\uca5d \ub9e5\ubc14",
+    "\uc138\uc0c1\ub2e8\ub2e8 \uc624\ub9ac\ub098\ub974",
+    "\ub4dc\ub974\ub801\ucfe8 \uc288\uc544\ub098",
+    "\uc9c4\uc9dc\uc5d0\uc694 \ud790\ub7ec\ub9bd",
+    "\ud0f1\ucee4\ucc28\uc774 \ub9e5\uadf8\ub9c8",
+    "\ud384\uc2a4\ubd80\ucc29 \ub51c\ub3d9\ud559",
+    "\ub0a8\ub2e4\ub974\ub2e4 \ub3d9\uc6b0\uac00",
+    "\ub0e5\ub0e5\ub0e5\ub0e5 \ubc14\uc69c\ub0e5",
+    "\ub3c4\ub9ac\uae68\uae61 \uc131\ub9ac\uae30\ud14c",
+    "\ub3d9\uc5d0\ubc88\uca4d \uc6a9\uc11c\ub514",
+    "\uc774\uac78\uc0b4\ub824 \ube59\ub9ac\ucf54",
+    "\uc0ac\uc2ac\uc801\uc911 \uc131\uc988\ud0a4",
+    "\uc6b0\uac00\uc6b0\uac00 \uc900\uc2a4\ud134",
+    "\uc624\uc778\uc790\ud0c4 \ub9e5\ub9ac\uc57c",
+    "\uc0ac\uc774\ub4dc\ud0b9 \ud76c\ub808\uc774\uc11c",
+    "\uce7c\ub85c\uc53d\uc53d \ubc30\ub370\ud0c0",
+    "\uc608\uc220\ubc29\uc6b8 \ube59\ub9ac\ucf54",
+    "\ud5e4\ub4dc\ub97c\ud0d5 \ud0ac\ub3c4\uc6b0"
+]
 
 
 class ForbiddenError(PermissionError):
@@ -135,12 +154,27 @@ def make_password_hash(password: str, salt: bytes | None = None) -> tuple[bytes,
     return actual_salt, derived
 
 
-def nickname_candidate(number: int) -> str:
-    if number == 105:
-        return "데굴데굴 준킹볼 105"
-    adjective = secrets.choice(NICKNAME_ADJECTIVES)
-    hero = secrets.choice(HERO_NAMES)
-    return f"{adjective} {hero} {number}"
+def generate_nickname(connection):
+    used = {
+        row["nickname"]
+        for row in connection.execute("SELECT nickname FROM users").fetchall()
+    }
+
+    rng = secrets.SystemRandom()
+
+    for start, stop in ((10, 1000), (1000, 10000)):
+        bases = list(OPCA_NICKNAME_BASES)
+        rng.shuffle(bases)
+
+        for base in bases:
+            numbers = rng.sample(range(start, stop), stop - start)
+
+            for number in numbers:
+                candidate = f"{base} {number}"
+                if candidate not in used:
+                    return candidate
+
+    raise RuntimeError("No available nickname remains.")
 
 
 def get_card_metadata(value: object) -> dict:
@@ -500,14 +534,13 @@ class OpcaHandler(SimpleHTTPRequestHandler):
                     if connection.execute("SELECT 1 FROM users WHERE username = ? COLLATE NOCASE", (username,)).fetchone():
                         self.send_json(HTTPStatus.CONFLICT, {"error": "이미 사용 중인 아이디입니다."})
                         return
-                    nickname = None
-                    for number in [105, *secrets.SystemRandom().sample(range(10, 100), 90)]:
-                        candidate = nickname_candidate(number)
-                        if not connection.execute("SELECT 1 FROM users WHERE nickname = ?", (candidate,)).fetchone():
-                            nickname = candidate
-                            break
-                    if nickname is None:
-                        self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "익명 닉네임을 생성하지 못했습니다."})
+                    try:
+                        nickname = generate_nickname(connection)
+                    except RuntimeError:
+                        self.send_json(
+                            HTTPStatus.INTERNAL_SERVER_ERROR,
+                            {"error": "No available nickname remains."}
+                        )
                         return
                     salt, password_hash = make_password_hash(password)
                     cursor = connection.execute(

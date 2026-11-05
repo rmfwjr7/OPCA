@@ -521,7 +521,20 @@
       .admin-photo-card { grid-template-columns: 82px minmax(0,1fr); gap: 9px; padding: 9px; }
       .admin-photo-card img { width: 82px; height: 105px; }
     }
-  </style>
+
+    .trade-safety-modal { width: min(100%, 440px); }
+    .trade-safety-content { padding: 21px 22px 22px; }
+    .trade-safety-icon { width: 46px; height: 46px; display: grid; place-items: center; margin: 0 auto 12px; border-radius: 14px; background: #fff0e8; color: #c85c35; font-size: 23px; }
+    .trade-safety-content h4 { margin: 0 0 8px; text-align: center; font-size: 17px; }
+    .trade-safety-lead { margin: 0 0 17px; color: #827872; text-align: center; font-size: 12px; line-height: 1.65; }
+    .trade-safety-list { margin: 0; padding: 14px 15px 14px 32px; border: 1px solid #f0dfd5; border-radius: 9px; background: #fff8f4; color: #65584f; font-size: 12px; line-height: 1.8; }
+    .trade-safety-list li + li { margin-top: 7px; }
+    .trade-safety-disclaimer { margin: 13px 0 0; color: #9a6552; font-size: 11px; line-height: 1.65; }
+    .trade-safety-actions { display: flex; gap: 8px; margin-top: 19px; }
+    .trade-safety-cancel { flex: 1; border: 1px solid var(--line); border-radius: 7px; background: white; color: #756a63; padding: 11px 12px; font-size: 12px; font-weight: 800; }
+    .trade-safety-confirm { flex: 1.5; border: 0; border-radius: 7px; background: var(--orange); color: white; padding: 11px 12px; font-size: 12px; font-weight: 800; }
+    .trade-safety-confirm:hover { background: var(--orange-dark); }
+</style>
 </head>
 <body>
   <div class="topline"></div>
@@ -707,6 +720,26 @@
       <div class="modal-head"><div class="chat-person"><span class="avatar" id="chatAvatar">L</span><div><h3 id="chatTitle">포카 거래 채팅</h3><span id="chatSubtitle" class="card-kicker">Lip · 2023 정규 시즌</span></div></div><button class="close-button" data-close="chatOverlay" aria-label="닫기">×</button></div>
       <div class="chat-history" id="chatHistory"><p class="chat-caption">거래 조건과 포카 상태를 충분히 확인해 주세요.</p><div class="message">안녕하세요! 포카 아직 거래 가능한가요?</div></div>
       <form class="chat-compose" id="chatForm"><input id="chatInput" placeholder="메시지를 입력하세요" autocomplete="off" required><button class="submit-button" type="submit">전송</button></form>
+    </div>
+  </div>
+  <div class="overlay" id="tradeSafetyOverlay" role="dialog" aria-modal="true" aria-labelledby="tradeSafetyTitle">
+    <div class="modal trade-safety-modal">
+      <div class="modal-head"><h3 id="tradeSafetyTitle">안전한 포카 거래를 위한 안내</h3><button class="close-button" data-close="tradeSafetyOverlay" aria-label="닫기">×</button></div>
+      <div class="trade-safety-content">
+        <div class="trade-safety-icon" aria-hidden="true">⚠</div>
+        <h4>거래 전 꼭 확인해 주세요!</h4>
+        <p class="trade-safety-lead">안전하고 즐거운 포카 거래를 위해 아래 내용을 확인해 주세요.</p>
+        <ul class="trade-safety-list">
+          <li>안전을 위해 사람이 많은 공공장소에서의 <strong>직접 만나서 하는 현장 거래를 권장합니다.</strong></li>
+          <li>택배·계좌이체 거래 시 상대방의 정보와 거래 조건을 신중하게 확인해 주세요.</li>
+          <li>입금 전 포카 실물 사진과 거래 내역을 확인하고, 대화 기록을 보관해 주세요.</li>
+        </ul>
+        <p class="trade-safety-disclaimer">OPCA는 이용자 간 거래의 당사자가 아니며, 이용자 간 거래에서 발생하는 사기 피해에 대해 책임을 지지 않습니다(관련 법령상 책임은 제외). 거래 전 상대방과 거래 조건을 충분히 확인해 주세요.</p>
+        <div class="trade-safety-actions">
+          <button class="trade-safety-cancel" type="button" id="cancelTradeSafety">취소</button>
+          <button class="trade-safety-confirm" type="button" id="confirmTradeSafety">확인하고 채팅 시작</button>
+        </div>
+      </div>
     </div>
   </div>
   <div class="overlay auth-overlay" id="authOverlay" role="dialog" aria-modal="true" aria-labelledby="authTitle">
@@ -1314,6 +1347,7 @@
         showToast(error.message);
       }
     }
+    let pendingSafetyChat = null;
     async function openChat(id, recipientId = null) {
       if (!profile) return openAuth(`chat:${id}`);
       const item = [...listings, ...exchanges].find((entry) => entry.id === id);
@@ -1322,6 +1356,16 @@
         showToast("내 매물의 대화는 마이페이지 채팅 목록에서 열어주세요.");
         return;
       }
+      pendingSafetyChat = { id, recipientId };
+      openOverlay("tradeSafetyOverlay");
+    }
+    async function continueToChat() {
+      if (!pendingSafetyChat) return;
+      const { id, recipientId } = pendingSafetyChat;
+      pendingSafetyChat = null;
+      closeOverlay("tradeSafetyOverlay");
+      const item = [...listings, ...exchanges].find((entry) => entry.id === id);
+      if (!item || !profile) return;
       activeChatListingId = id;
       activeChatRecipientId = recipientId;
       document.getElementById("chatAvatar").textContent = (item.seller || "O").slice(0, 1);
@@ -1332,6 +1376,12 @@
       await refreshActiveChat();
       document.getElementById("chatInput").focus();
     }
+    document.getElementById("confirmTradeSafety").addEventListener("click", continueToChat);
+    document.getElementById("cancelTradeSafety").addEventListener("click", () => {
+      pendingSafetyChat = null;
+      closeOverlay("tradeSafetyOverlay");
+    });
+    document.querySelector('[data-close="tradeSafetyOverlay"]').addEventListener("click", () => { pendingSafetyChat = null; });
     document.getElementById("chatForm").addEventListener("submit", async (event) => {
       event.preventDefault();
       const input = document.getElementById("chatInput");
