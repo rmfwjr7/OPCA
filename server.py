@@ -10,6 +10,7 @@ import secrets
 import sqlite3
 import time
 import shutil
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -32,6 +33,25 @@ PUBLIC_CARD_DIR = Path(os.environ.get("OPCA_CARD_DIR", BASE_DIR / "cards"))
 ADMIN_USERNAME = "찍찍이".casefold()
 USERNAME_RE = re.compile(r"^[A-Za-z0-9가-힣_.-]{3,24}$")
 CARD_IMAGE_PATH_RE = re.compile(r"^/cards/[a-f0-9]{32}\.(?:jpg|png|webp)$")
+LISTING_ID_RE = re.compile(r"^/api/listings/([A-Za-z0-9_-]{1,64})$")
+LISTING_CONDITIONS = {"하자 없음", "조금 있음", "많이 있음"}
+
+# ---- 푸시 알림 (Web Push) 설정 -------------------------------------------
+# Render 환경변수 VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY 가 있고 pywebpush 가 설치돼 있을 때만 켜집니다.
+try:
+    from pywebpush import webpush, WebPushException
+except ImportError:  # pywebpush 미설치 시 푸시만 꺼진 채로 서버는 정상 동작
+    webpush = None
+
+    class WebPushException(Exception):
+        pass
+
+VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "").strip()
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "").strip()
+VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "https://opca.onrender.com").strip()
+PUSH_ENABLED = bool(webpush and VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY)
+# 사용자가 보낸 구독 주소로 서버가 요청을 보내므로, 알려진 푸시 서비스 도메인만 허용합니다.
+PUSH_ALLOWED_HOST_SUFFIXES = ("googleapis.com", "push.services.mozilla.com", "push.apple.com", "notify.windows.com")
 OPCA_NICKNAME_BASES = [
     "\ub370\uad74\ub370\uad74 \uc900\ud0b9\ubcfc",
     "\ub0e0\ub0e0\uca5d\uca5d \ub9e5\ubc14",
@@ -117,7 +137,8 @@ def initialize_database() -> None:
                 sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 recipient_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 body TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                read_at TEXT
             );
             CREATE TABLE IF NOT EXISTS photo_submissions (
                 id TEXT PRIMARY KEY,
@@ -159,8 +180,22 @@ def initialize_database() -> None:
                 banned_until TEXT,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS push_subscriptions (
+                endpoint TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                p256dh TEXT NOT NULL,
+                auth TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS push_subscriptions_user_idx ON push_subscriptions(user_id);
             """
         )
+        # 기존 DB 마이그레이션: messages.read_at 컬럼 추가 (이미 있던 메시지는 모두 읽음 처리)
+        message_columns = {row["name"] for row in connection.execute("PRAGMA table_info(messages)")}
+        if "read_at" not in message_columns:
+            connection.execute("ALTER TABLE messages ADD COLUMN read_at TEXT")
+            connection.execute("UPDATE messages SET read_at = created_at")
+        connection.execute("CREATE INDEX IF NOT EXISTS messages_unread_idx ON messages(recipient_id, read_at)")
         connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (int(time.time()),))
 
 
@@ -288,6 +323,60 @@ def create_session(connection: sqlite3.Connection, user_id: int) -> str:
     return raw_token
 
 
+def is_allowed_push_endpoint(endpoint: object) -> bool:
+    if not isinstance(endpoint, str) or len(endpoint) > 2000:
+        return False
+    parsed = urlparse(endpoint)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not host:
+        return False
+    return any(host == suffix or host.endswith("." + suffix) for suffix in PUSH_ALLOWED_HOST_SUFFIXES)
+
+
+def send_chat_push(recipient_id: int, sender_nickname: str, message: str, listing_id: str) -> None:
+    """새 메시지가 오면 받는 사람의 모든 기기로 푸시 알림을 보냅니다. (백그라운드 스레드에서 실행)"""
+    if not PUSH_ENABLED:
+        return
+    try:
+        with database() as connection:
+            recipient = connection.execute("SELECT chat_notifications FROM users WHERE id = ?", (recipient_id,)).fetchone()
+            if recipient is None or not recipient["chat_notifications"]:
+                return
+            subscriptions = connection.execute(
+                "SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = ?", (recipient_id,)
+            ).fetchall()
+        if not subscriptions:
+            return
+        preview = message if len(message) <= 60 else message[:60] + "…"
+        payload = json.dumps(
+            {"title": "OPCA 새 메시지", "body": f"{sender_nickname}: {preview}", "url": "/?open=mypage", "tag": f"chat-{listing_id}"},
+            ensure_ascii=False,
+        )
+        expired = []
+        for subscription in subscriptions:
+            try:
+                webpush(
+                    subscription_info={"endpoint": subscription["endpoint"], "keys": {"p256dh": subscription["p256dh"], "auth": subscription["auth"]}},
+                    data=payload,
+                    vapid_private_key=VAPID_PRIVATE_KEY,
+                    vapid_claims={"sub": VAPID_SUBJECT},
+                    ttl=3600,
+                )
+            except WebPushException as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status in (404, 410):  # 만료되었거나 취소된 구독
+                    expired.append(subscription["endpoint"])
+                else:
+                    print(f"Push send failed ({status}): {exc}")
+            except Exception as exc:
+                print(f"Push send error: {type(exc).__name__}: {exc}")
+        if expired:
+            with database() as connection:
+                connection.executemany("DELETE FROM push_subscriptions WHERE endpoint = ?", [(endpoint,) for endpoint in expired])
+    except Exception as exc:
+        print(f"Push error: {type(exc).__name__}: {exc}")
+
+
 class OpcaHandler(SimpleHTTPRequestHandler):
     server_version = "OPCA/1.0"
 
@@ -298,7 +387,7 @@ class OpcaHandler(SimpleHTTPRequestHandler):
         print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}")
 
     def end_headers(self) -> None:
-        if self.path in {"/index.html", "/roster-data.js"}:
+        if self.path in {"/index.html", "/roster-data.js", "/sw.js"}:
             self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "same-origin")
@@ -478,6 +567,17 @@ class OpcaHandler(SimpleHTTPRequestHandler):
                         return
                     self.send_file_bytes(HTTPStatus.OK, image_path.read_bytes(), row["mime_type"])
                     return
+                if path == "/api/notifications":
+                    user = self.require_user(connection)
+                    unread = connection.execute(
+                        "SELECT COUNT(*) FROM messages WHERE recipient_id = ? AND read_at IS NULL", (user["id"],)
+                    ).fetchone()[0]
+                    self.send_json(HTTPStatus.OK, {"unread": unread})
+                    return
+                if path == "/api/push/public-key":
+                    self.require_user(connection)
+                    self.send_json(HTTPStatus.OK, {"enabled": PUSH_ENABLED, "publicKey": VAPID_PUBLIC_KEY if PUSH_ENABLED else ""})
+                    return
                 if path == "/api/my/listings":
                     user = self.require_user(connection)
                     rows = connection.execute(
@@ -532,7 +632,10 @@ class OpcaHandler(SimpleHTTPRequestHandler):
                             "otherNickname": other_name,
                             "lastMessage": last["body"],
                             "updatedAt": last["created_at"],
-                            "unread": 0,
+                            "unread": connection.execute(
+                                "SELECT COUNT(*) FROM messages WHERE listing_id = ? AND recipient_id = ? AND read_at IS NULL",
+                                (row["listing_id"], user["id"]),
+                            ).fetchone()[0],
                         })
                     self.send_json(HTTPStatus.OK, {"items": chats})
                     return
@@ -547,6 +650,12 @@ class OpcaHandler(SimpleHTTPRequestHandler):
                                     ORDER BY messages.id""",
                                 (listing_id, user["id"], user["id"]),
                     ).fetchall()
+                    # 대화방을 열어서 본 메시지는 읽음 처리합니다.
+                    connection.execute(
+                        "UPDATE messages SET read_at = ? WHERE listing_id = ? AND recipient_id = ? AND read_at IS NULL",
+                        (now_iso(), listing_id, user["id"]),
+                    )
+                    connection.commit()  # 응답 직후 요청에서도 읽음 상태가 바로 보이도록 먼저 커밋
                     self.send_json(HTTPStatus.OK, {"items": [self.public_message(row) for row in rows]})
                     return
                 if path.startswith("/api/settings"):
@@ -570,7 +679,7 @@ class OpcaHandler(SimpleHTTPRequestHandler):
             self.path = "/index.html"
             super().do_GET()
             return
-        if path == "/roster-data.js":
+        if path in {"/roster-data.js", "/sw.js"}:
             super().do_GET()
             return
         if CARD_IMAGE_PATH_RE.fullmatch(path):
@@ -587,7 +696,7 @@ class OpcaHandler(SimpleHTTPRequestHandler):
             self.path = "/index.html"
             super().do_HEAD()
             return
-        if path == "/roster-data.js":
+        if path in {"/roster-data.js", "/sw.js"}:
             super().do_HEAD()
             return
         if CARD_IMAGE_PATH_RE.fullmatch(path):
@@ -849,6 +958,39 @@ class OpcaHandler(SimpleHTTPRequestHandler):
                     connection.execute("DELETE FROM user_bans WHERE user_id = ?", (int(unban_match.group(1)),))
                     self.send_json(HTTPStatus.OK, {"ok": True})
                     return
+                if path == "/api/push/subscribe":
+                    user = self.require_user(connection)
+                    subscription = body.get("subscription")
+                    keys = subscription.get("keys") if isinstance(subscription, dict) else None
+                    if not isinstance(keys, dict):
+                        raise ValueError("알림 구독 정보가 올바르지 않습니다.")
+                    endpoint = subscription.get("endpoint")
+                    p256dh = keys.get("p256dh")
+                    auth = keys.get("auth")
+                    if not is_allowed_push_endpoint(endpoint) or not all(isinstance(v, str) and 0 < len(v) <= 200 for v in (p256dh, auth)):
+                        raise ValueError("지원하지 않는 알림 구독 정보입니다.")
+                    connection.execute(
+                        """INSERT INTO push_subscriptions(endpoint, user_id, p256dh, auth, created_at) VALUES (?, ?, ?, ?, ?)
+                           ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id, p256dh=excluded.p256dh,
+                             auth=excluded.auth, created_at=excluded.created_at""",
+                        (endpoint, user["id"], p256dh, auth, now_iso()),
+                    )
+                    connection.execute(
+                        """DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint NOT IN
+                           (SELECT endpoint FROM push_subscriptions WHERE user_id = ? ORDER BY created_at DESC LIMIT 10)""",
+                        (user["id"], user["id"]),
+                    )
+                    connection.commit()
+                    self.send_json(HTTPStatus.OK, {"ok": True})
+                    return
+                if path == "/api/push/unsubscribe":
+                    user = self.require_user(connection)
+                    endpoint = body.get("endpoint")
+                    if isinstance(endpoint, str):
+                        connection.execute("DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?", (endpoint, user["id"]))
+                    connection.commit()
+                    self.send_json(HTTPStatus.OK, {"ok": True})
+                    return
                 if path.startswith("/api/chats/") and path.endswith("/messages"):
                     user = self.require_user(connection)
                     ban = get_active_ban(connection, user["id"])
@@ -886,6 +1028,12 @@ class OpcaHandler(SimpleHTTPRequestHandler):
                         "SELECT messages.*, users.nickname AS sender_nickname FROM messages JOIN users ON users.id = messages.sender_id WHERE messages.id = ?",
                         (cursor.lastrowid,),
                     ).fetchone()
+                    connection.commit()  # 받는 사람의 알림 배지가 바로 반영되도록 먼저 커밋
+                    threading.Thread(
+                        target=send_chat_push,
+                        args=(int(recipient_id), row["sender_nickname"], message, listing_id),
+                        daemon=True,
+                    ).start()
                     self.send_json(HTTPStatus.CREATED, {"item": self.public_message(row)})
                     return
         except ValueError as exc:
@@ -911,6 +1059,10 @@ class OpcaHandler(SimpleHTTPRequestHandler):
         try:
             self.check_origin()
             body = self.read_json()
+            listing_match = LISTING_ID_RE.fullmatch(path)
+            if listing_match:
+                self.update_listing(listing_match.group(1), body)
+                return
             if path != "/api/settings":
                 self.send_json(HTTPStatus.NOT_FOUND, {"error": "요청한 API를 찾을 수 없습니다."})
                 return
@@ -925,11 +1077,81 @@ class OpcaHandler(SimpleHTTPRequestHandler):
                 self.send_json(HTTPStatus.OK, {"chatNotifications": bool(chat_notifications), "favoriteNotifications": bool(favorite_notifications)})
         except ValueError as exc:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except ForbiddenError as exc:
+            self.send_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
         except PermissionError as exc:
             self.send_json(HTTPStatus.UNAUTHORIZED, {"error": str(exc)})
         except Exception as exc:
-            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "서버에서 설정을 저장하지 못했습니다."})
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "서버에서 요청을 처리하지 못했습니다."})
             print(f"API PATCH error: {type(exc).__name__}: {exc}")
+
+    def update_listing(self, listing_id: str, body: dict) -> None:
+        """내가 올린 글 수정 (가격 / 하자 유무 / 거래 메모만 수정 가능)"""
+        with database() as connection:
+            user = self.require_user(connection)
+            listing = connection.execute("SELECT * FROM listings WHERE id = ?", (listing_id,)).fetchone()
+            if listing is None:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "매물을 찾을 수 없습니다."})
+                return
+            if listing["owner_id"] != user["id"]:
+                raise ForbiddenError("내가 올린 글만 수정할 수 있어요.")
+            payload = json.loads(listing["payload"])
+            if "condition" in body:
+                condition = str(body["condition"]).strip()
+                if condition not in LISTING_CONDITIONS:
+                    raise ValueError("하자 유무를 다시 선택해 주세요.")
+                payload["condition"] = condition
+            if "details" in body:
+                details = str(body["details"]).strip()
+                if len(details) > 2000:
+                    raise ValueError("거래 메모는 2000자 이하로 입력해 주세요.")
+                payload["details"] = details
+            if "price" in body:
+                if listing["kind"] == "교환":
+                    raise ValueError("교환 매물에는 가격이 없어요.")
+                try:
+                    price = int(body["price"])
+                except (TypeError, ValueError):
+                    raise ValueError("가격을 숫자로 입력해 주세요.")
+                if price < 0 or price > 100_000_000:
+                    raise ValueError("가격은 0원 이상 1억 원 이하로 입력해 주세요.")
+                payload["price"] = price
+            connection.execute("UPDATE listings SET payload = ? WHERE id = ?", (json.dumps(payload, ensure_ascii=False), listing_id))
+            connection.commit()
+            row = connection.execute(
+                "SELECT listings.*, users.nickname FROM listings JOIN users ON users.id = listings.owner_id WHERE listings.id = ?",
+                (listing_id,),
+            ).fetchone()
+            self.send_json(HTTPStatus.OK, {"item": self.public_listing(row)})
+
+    def do_DELETE(self) -> None:
+        """내가 올린 글 삭제 (찜 / 채팅 내역은 외래키 CASCADE 로 함께 삭제)"""
+        path = unquote(urlparse(self.path).path)
+        try:
+            self.check_origin()
+            listing_match = LISTING_ID_RE.fullmatch(path)
+            if not listing_match:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "요청한 API를 찾을 수 없습니다."})
+                return
+            listing_id = listing_match.group(1)
+            with database() as connection:
+                user = self.require_user(connection)
+                listing = connection.execute("SELECT owner_id FROM listings WHERE id = ?", (listing_id,)).fetchone()
+                if listing is None:
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "매물을 찾을 수 없습니다."})
+                    return
+                if listing["owner_id"] != user["id"]:
+                    raise ForbiddenError("내가 올린 글만 삭제할 수 있어요.")
+                connection.execute("DELETE FROM listings WHERE id = ?", (listing_id,))
+                connection.commit()
+                self.send_json(HTTPStatus.OK, {"ok": True})
+        except ForbiddenError as exc:
+            self.send_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
+        except PermissionError as exc:
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"error": str(exc)})
+        except Exception as exc:
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "서버에서 요청을 처리하지 못했습니다."})
+            print(f"API DELETE error: {type(exc).__name__}: {exc}")
 
     def session_cookie(self, token: str) -> tuple[str, str]:
         secure = "; Secure" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else ""

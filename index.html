@@ -549,6 +549,17 @@
     .trade-safety-cancel { flex: 1; border: 1px solid var(--line); border-radius: 7px; background: white; color: #756a63; padding: 11px 12px; font-size: 12px; font-weight: 800; }
     .trade-safety-confirm { flex: 1.5; border: 0; border-radius: 7px; background: var(--orange); color: white; padding: 11px 12px; font-size: 12px; font-weight: 800; }
     .trade-safety-confirm:hover { background: var(--orange-dark); }
+
+    /* ---- 내 글 관리 / 알림 ---- */
+    #myPageButton { position: relative; overflow: visible; }
+    .notif-badge { position: absolute; top: -7px; right: -7px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px; background: #e5484d; color: white; font-size: 10px; font-weight: 800; line-height: 18px; text-align: center; box-shadow: 0 0 0 2px var(--paper); pointer-events: none; }
+    .chat-unread { flex: 0 0 auto; min-width: 20px; height: 20px; padding: 0 6px; border-radius: 999px; background: #e5484d; color: white; font-size: 11px; font-weight: 800; line-height: 20px; text-align: center; }
+    .my-actions { display: flex; gap: 6px; margin-top: 10px; }
+    .exchange-listing-card .my-actions { margin-left: 12px; margin-right: 12px; }
+    .my-actions button { flex: 1; border: 1px solid var(--line); border-radius: 7px; padding: 7px 0; background: white; font-size: 11px; font-weight: 800; }
+    .my-actions button.danger { border-color: #f3c9c9; color: #c43b3b; background: #fff6f6; }
+    .edit-listing-summary { margin-bottom: 12px; padding: 10px 12px; border-radius: 8px; background: var(--peach-light); font-size: 12px; font-weight: 700; }
+    .push-row .backup-action { flex: 0 0 auto; }
 </style>
 </head>
 <body>
@@ -654,11 +665,17 @@
         <div class="chat-list" id="chatList"></div>
         <div class="mypage-empty" id="chatListEmpty">아직 시작한 채팅이 없어요.</div>
       </section>
+      <section class="mypage-section" id="myListingSection">
+        <div class="mypage-section-title-row"><h2 class="mypage-heading">내가 올린 포카</h2><span class="result-count" id="myListingCount">0개</span></div>
+        <div class="cards" id="myListingCards"></div>
+        <div class="mypage-empty" id="myListingEmpty">아직 올린 포카가 없어요.</div>
+      </section>
       <section class="mypage-section">
         <h2 class="mypage-heading">설정</h2>
         <div class="settings-list">
           <label class="setting-row"><span><strong>채팅 알림</strong><small>새 메시지 알림 설정</small></span><input id="chatNotificationSetting" type="checkbox"></label>
           <label class="setting-row"><span><strong>찜한 포카 알림</strong><small>찜 목록 관련 알림 설정</small></span><input id="favoriteNotificationSetting" type="checkbox"></label>
+          <div class="setting-row push-row"><span><strong>기기 푸시 알림</strong><small id="pushStatusText">이 기기로 새 메시지 알림을 받아요.</small></span><button class="backup-action" id="pushToggleButton" type="button">알림 켜기</button></div>
         </div>
       </section>
       <section class="mypage-section">
@@ -777,6 +794,20 @@
       </form>
     </div>
   </div>
+  <div class="overlay" id="editListingOverlay" role="dialog" aria-modal="true" aria-labelledby="editListingTitle">
+    <div class="modal">
+      <div class="modal-head"><h3 id="editListingTitle">내 포카 수정</h3><button class="close-button" data-close="editListingOverlay" aria-label="닫기">×</button></div>
+      <form class="modal-content" id="editListingForm">
+        <div class="edit-listing-summary" id="editListingSummary"></div>
+        <div class="form-row">
+          <div class="field" id="editPriceField"><label for="editPriceInput">가격 (원) *</label><input id="editPriceInput" type="number" min="0" step="1"></div>
+          <div class="field"><label for="editConditionInput">하자 유무 *</label><select id="editConditionInput"><option>하자 없음</option><option>조금 있음</option><option>많이 있음</option></select></div>
+        </div>
+        <div class="field"><label for="editDetailsInput">거래 메모</label><textarea id="editDetailsInput" maxlength="2000" placeholder="포카 상태나 거래 방법을 적어주세요."></textarea></div>
+        <div class="form-foot"><small>선수·구단 등 카드 정보는 바꿀 수 없어요. 잘못 올렸다면 삭제 후 다시 등록해 주세요.</small><button class="submit-button" type="submit">저장</button></div>
+      </form>
+    </div>
+  </div>
   <div class="toast" id="toast" role="status"></div>
 
   <script>
@@ -789,6 +820,10 @@
     let adminPhotoSubmissions = [];
     let adminChatReports = [];
     let adminBans = [];
+    let myListings = [];
+    let unreadCount = 0;
+    let lastUnreadCount = 0;
+    let pushSyncedUserId = null;
     let profile = null;
     let settings = { chatNotifications: true, favoriteNotifications: false };
     let section = "sale";
@@ -818,8 +853,15 @@
     }
     function updateAccountButton() {
       const button = document.getElementById("myPageButton");
+      const unread = profile && settings.chatNotifications ? unreadCount : 0;
       button.textContent = profile ? "마이페이지" : "로그인";
-      button.setAttribute("aria-label", profile ? "마이페이지" : "로그인");
+      button.setAttribute("aria-label", profile ? (unread ? `마이페이지, 안 읽은 메시지 ${unread}개` : "마이페이지") : "로그인");
+      if (unread > 0) {
+        const badge = document.createElement("span");
+        badge.className = "notif-badge";
+        badge.textContent = unread > 99 ? "99+" : String(unread);
+        button.appendChild(badge);
+      }
     }
     function updateProfilePanel() {
       document.getElementById("profileNickname").textContent = profile?.nickname || "로그인해 주세요";
@@ -839,13 +881,16 @@
       exchanges = response.items.filter((item) => item.kind === "교환");
       cardImages = imageResponse.items;
       if (profile) {
-        const [favoriteResponse, settingsResponse, chatsResponse, photoResponse] = await Promise.all([
-          api("/api/favorites"), api("/api/settings"), api("/api/chats"), api("/api/photo-submissions")
+        const [favoriteResponse, settingsResponse, chatsResponse, photoResponse, myListingsResponse, notificationResponse] = await Promise.all([
+          api("/api/favorites"), api("/api/settings"), api("/api/chats"), api("/api/photo-submissions"), api("/api/my/listings"), api("/api/notifications")
         ]);
         favorites = favoriteResponse.ids;
         settings = settingsResponse;
         chats = chatsResponse.items;
         myPhotoSubmissions = photoResponse.items;
+        myListings = myListingsResponse.items;
+        unreadCount = notificationResponse.unread;
+        lastUnreadCount = unreadCount;
         adminPhotoSubmissions = profile.isAdmin ? (await api("/api/admin/photo-submissions")).items : [];
         await loadAdminModeration();
       } else {
@@ -855,9 +900,14 @@
         adminPhotoSubmissions = [];
         adminChatReports = [];
         adminBans = [];
+        myListings = [];
+        unreadCount = 0;
+        lastUnreadCount = 0;
         settings = { chatNotifications: true, favoriteNotifications: false };
       }
       updateProfilePanel();
+      renderMyListings();
+      updatePushUi();
       renderPhotoSubmissions();
       renderAdminPhotoQueue();
       renderAdminModeration();
@@ -973,7 +1023,7 @@
       if (section === "saved") return [...listings, ...exchanges].filter((item) => favorites.includes(item.id));
       return listings.filter((item) => item.kind === listingKind);
     }
-    function renderCard(item, isExchange = false) {
+    function renderCard(item, isExchange = false, mine = false) {
       const isBuy = item.kind === "구매";
       const isSaved = favorites.includes(item.id);
       const sellerName = item.seller === "나" ? profile.nickname : item.seller || profile.nickname;
@@ -996,8 +1046,8 @@
           </div>`
         : `<div class="card-art">${findCardImage(item) ? `<img class="approved-card-image" src="${escapeHtml(findCardImage(item).url)}" alt="${escapeHtml(item.player)} 포카">` : `<div class="art-placeholder"><small>OPCA</small><strong>${escapeHtml(item.player)}</strong><span>${escapeHtml(item.season)} · ${escapeHtml(item.stage || "")}</span></div>`}</div>`;
       return `<article class="listing-card ${isExchange ? "exchange-listing-card" : ""}">
-        <div class="${isExchange ? "exchange-card-media" : "card-media"}">${artwork}<span class="type-badge">${badge}</span><button class="heart-button ${isSaved ? "active" : ""}" data-favorite="${escapeHtml(item.id)}" aria-label="찜 ${isSaved ? "취소" : "추가"}" title="${isSaved ? "찜 취소" : "찜하기"}">${isSaved ? "♥" : "♡"}</button></div>
-        <div class="card-body"><div class="card-kicker">${escapeHtml(item.team)} · ${escapeHtml(item.stage || "시즌 카드")} · ${escapeHtml(item.card)}</div><div class="card-title">${escapeHtml(item.title)}</div><div class="card-meta">${escapeHtml(item.condition || "하자 없음")}</div><div class="card-footer">${priceLine}<button class="chat-button" data-chat="${escapeHtml(item.id)}">${action}</button></div><div class="seller-line"><span class="seller-dot">${escapeHtml(sellerName.slice(0,1))}</span>${escapeHtml(sellerName)}</div></div>
+        <div class="${isExchange ? "exchange-card-media" : "card-media"}">${artwork}<span class="type-badge">${badge}</span>${mine ? "" : `<button class="heart-button ${isSaved ? "active" : ""}" data-favorite="${escapeHtml(item.id)}" aria-label="찜 ${isSaved ? "취소" : "추가"}" title="${isSaved ? "찜 취소" : "찜하기"}">${isSaved ? "♥" : "♡"}</button>`}</div>
+        <div class="card-body"><div class="card-kicker">${escapeHtml(item.team)} · ${escapeHtml(item.stage || "시즌 카드")} · ${escapeHtml(item.card)}</div><div class="card-title">${escapeHtml(item.title)}</div><div class="card-meta">${escapeHtml(item.condition || "하자 없음")}</div><div class="card-footer">${priceLine}${mine ? "" : `<button class="chat-button" data-chat="${escapeHtml(item.id)}">${action}</button>`}</div><div class="seller-line"><span class="seller-dot">${escapeHtml(sellerName.slice(0,1))}</span>${escapeHtml(sellerName)}</div>${mine ? `<div class="my-actions"><button type="button" data-edit-listing="${escapeHtml(item.id)}">수정</button><button type="button" class="danger" data-delete-listing="${escapeHtml(item.id)}">삭제</button></div>` : ""}</div>
       </article>`;
     }
     function renderFavorites() {
@@ -1009,7 +1059,7 @@
     function renderChatList() {
       const list = document.getElementById("chatList");
       document.getElementById("chatCount").textContent = `${chats.length}개`;
-      list.innerHTML = chats.map((chat) => `<button class="chat-list-item" data-open-chat="${escapeHtml(chat.listingId)}" data-recipient-id="${escapeHtml(chat.otherUserId)}"><span class="chat-list-avatar">${escapeHtml((chat.otherNickname || "OPCA").slice(0, 1))}</span><span class="chat-list-copy"><span class="chat-list-name">${escapeHtml(chat.otherNickname || "OPCA 회원")}</span><span class="chat-list-title">${escapeHtml(chat.listing.title || chat.listing.player || "포카 매물")}</span><span class="chat-list-last">${escapeHtml(chat.lastMessage)}</span></span></button>`).join("");
+      list.innerHTML = chats.map((chat) => `<button class="chat-list-item" data-open-chat="${escapeHtml(chat.listingId)}" data-recipient-id="${escapeHtml(chat.otherUserId)}"><span class="chat-list-avatar">${escapeHtml((chat.otherNickname || "OPCA").slice(0, 1))}</span><span class="chat-list-copy"><span class="chat-list-name">${escapeHtml(chat.otherNickname || "OPCA 회원")}</span><span class="chat-list-title">${escapeHtml(chat.listing.title || chat.listing.player || "포카 매물")}</span><span class="chat-list-last">${escapeHtml(chat.lastMessage)}</span></span>${chat.unread ? `<span class="chat-unread" aria-label="안 읽은 메시지 ${chat.unread}개">${chat.unread > 99 ? "99+" : chat.unread}</span>` : ""}</button>`).join("");
       document.getElementById("chatListEmpty").style.display = chats.length ? "none" : "block";
     }
     function findCardImage(item) {
@@ -1185,6 +1235,7 @@
       settings.favoriteNotifications = document.getElementById("favoriteNotificationSetting").checked;
       try {
         settings = await api("/api/settings", { method: "PATCH", body: JSON.stringify(settings) });
+        updateAccountButton();
       } catch (error) {
         showToast(error.message);
       }
@@ -1497,6 +1548,7 @@
       openOverlay("chatOverlay");
       await refreshActiveChat();
       document.getElementById("chatInput").focus();
+      refreshUnreadState();
     }
     document.getElementById("confirmTradeSafety").addEventListener("click", continueToChat);
     document.getElementById("cancelTradeSafety").addEventListener("click", () => {
@@ -1525,6 +1577,7 @@
     });
     document.getElementById("logoutButton").addEventListener("click", async () => {
       try {
+        await detachPushSubscription();
         await api("/api/auth/logout", { method: "POST", body: "{}" });
         profile = null;
         await refreshServerData();
@@ -1549,6 +1602,190 @@
       }
     });
     document.getElementById("loadMore").addEventListener("click", () => showToast("새 포카는 포카 등록 버튼에서 올려보세요."));
+    // ---------------------------------------------------------- 내가 올린 포카 (수정 / 삭제)
+    function renderMyListings() {
+      const container = document.getElementById("myListingCards");
+      if (!container) return;
+      document.getElementById("myListingCount").textContent = `${myListings.length}개`;
+      container.innerHTML = myListings.map((item) => renderCard(item, item.kind === "교환", true)).join("");
+      document.getElementById("myListingEmpty").style.display = myListings.length ? "none" : "block";
+    }
+    function replaceListing(updated) {
+      const swap = (items) => items.map((item) => item.id === updated.id ? updated : item);
+      listings = swap(listings);
+      exchanges = swap(exchanges);
+      myListings = swap(myListings);
+    }
+    function removeListing(id) {
+      const keep = (items) => items.filter((item) => item.id !== id);
+      listings = keep(listings);
+      exchanges = keep(exchanges);
+      myListings = keep(myListings);
+      favorites = favorites.filter((favoriteId) => favoriteId !== id);
+      chats = chats.filter((chat) => chat.listingId !== id);
+    }
+    let editingListingId = null;
+    function openEditListing(id) {
+      const item = myListings.find((entry) => entry.id === id);
+      if (!item) return;
+      editingListingId = id;
+      const isExchange = item.kind === "교환";
+      document.getElementById("editListingSummary").textContent = isExchange ? item.title : `${item.title} · ${item.team} · ${item.card}`;
+      document.getElementById("editPriceField").hidden = isExchange;
+      document.getElementById("editPriceInput").required = !isExchange;
+      document.getElementById("editPriceInput").value = isExchange ? "" : (item.price ?? 0);
+      const knownConditions = ["하자 없음", "조금 있음", "많이 있음"];
+      document.getElementById("editConditionInput").value = knownConditions.includes(item.condition) ? item.condition : "하자 없음";
+      document.getElementById("editDetailsInput").value = item.details || "";
+      openOverlay("editListingOverlay");
+    }
+    document.getElementById("myListingCards").addEventListener("click", async (event) => {
+      const editButton = event.target.closest("[data-edit-listing]");
+      if (editButton) return openEditListing(editButton.dataset.editListing);
+      const deleteButton = event.target.closest("[data-delete-listing]");
+      if (!deleteButton) return;
+      if (!confirm("이 글을 삭제할까요?\n찜 목록과 이 글에서 나눈 채팅 내역도 함께 사라져요.")) return;
+      deleteButton.disabled = true;
+      try {
+        const id = deleteButton.dataset.deleteListing;
+        await api(`/api/listings/${encodeURIComponent(id)}`, { method: "DELETE" });
+        removeListing(id);
+        renderMyListings();
+        renderChatList();
+        render();
+        refreshUnreadState();
+        showToast("글을 삭제했어요.");
+      } catch (error) {
+        deleteButton.disabled = false;
+        showToast(error.message);
+      }
+    });
+    document.getElementById("editListingForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!editingListingId) return;
+      const item = myListings.find((entry) => entry.id === editingListingId);
+      if (!item) return;
+      const body = {
+        condition: document.getElementById("editConditionInput").value,
+        details: document.getElementById("editDetailsInput").value,
+      };
+      if (item.kind !== "교환") body.price = Number(document.getElementById("editPriceInput").value);
+      try {
+        const response = await api(`/api/listings/${encodeURIComponent(editingListingId)}`, { method: "PATCH", body: JSON.stringify(body) });
+        replaceListing(response.item);
+        editingListingId = null;
+        closeOverlay("editListingOverlay");
+        renderMyListings();
+        render();
+        showToast("수정했어요.");
+      } catch (error) {
+        showToast(error.message);
+      }
+    });
+
+    // ---------------------------------------------------------- 알림 (배지 + 기기 푸시)
+    async function pollNotifications() {
+      if (!profile) return;
+      try {
+        const response = await api("/api/notifications");
+        unreadCount = response.unread;
+        updateAccountButton();
+        const chatOpen = document.getElementById("chatOverlay").classList.contains("open");
+        if (unreadCount > lastUnreadCount && settings.chatNotifications && !chatOpen) {
+          showToast("새 메시지가 도착했어요. 마이페이지에서 확인해 보세요.");
+        }
+        lastUnreadCount = unreadCount;
+      } catch { /* 다음 주기에 다시 시도합니다. */ }
+    }
+    async function refreshUnreadState() {
+      if (!profile) return;
+      try {
+        chats = (await api("/api/chats")).items;
+        renderChatList();
+      } catch { /* ignore */ }
+      await pollNotifications();
+    }
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) pollNotifications(); });
+
+    function pushSupported() { return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window; }
+    function urlBase64ToUint8Array(base64String) {
+      const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+      const raw = atob((base64String + padding).replace(/-/g, "+").replace(/_/g, "/"));
+      return Uint8Array.from(raw, (char) => char.charCodeAt(0));
+    }
+    async function currentPushSubscription() {
+      const registration = await navigator.serviceWorker.getRegistration();
+      return registration ? registration.pushManager.getSubscription() : null;
+    }
+    async function updatePushUi() {
+      const button = document.getElementById("pushToggleButton");
+      const text = document.getElementById("pushStatusText");
+      if (!button || !text) return;
+      if (!profile) { pushSyncedUserId = null; button.hidden = true; return; }
+      button.hidden = false;
+      if (!pushSupported()) {
+        button.disabled = true;
+        button.textContent = "지원 안 됨";
+        text.textContent = "이 브라우저는 푸시 알림을 지원하지 않아요. (아이폰은 사파리 공유 버튼 → 홈 화면에 추가 후 사용할 수 있어요.)";
+        return;
+      }
+      if (Notification.permission === "denied") {
+        button.disabled = true;
+        button.textContent = "차단됨";
+        text.textContent = "브라우저 설정에서 이 사이트의 알림 권한을 허용해 주세요.";
+        return;
+      }
+      button.disabled = false;
+      let subscription = null;
+      try { subscription = await currentPushSubscription(); } catch { /* ignore */ }
+      button.textContent = subscription ? "알림 끄기" : "알림 켜기";
+      text.textContent = subscription ? "이 기기로 새 메시지 알림을 받고 있어요." : "이 기기로 새 메시지 알림을 받아요. (사이트를 닫아도 도착해요)";
+      // 이 기기의 구독을 현재 로그인한 계정에 연결합니다. (계정을 바꿔 로그인한 경우 대비)
+      if (subscription && pushSyncedUserId !== profile.id) {
+        pushSyncedUserId = profile.id;
+        api("/api/push/subscribe", { method: "POST", body: JSON.stringify({ subscription: subscription.toJSON() }) }).catch(() => { pushSyncedUserId = null; });
+      }
+    }
+    async function detachPushSubscription() {
+      try {
+        if (!pushSupported()) return;
+        const subscription = await currentPushSubscription();
+        if (subscription) await api("/api/push/unsubscribe", { method: "POST", body: JSON.stringify({ endpoint: subscription.endpoint }) });
+      } catch { /* 로그아웃은 계속 진행합니다. */ }
+    }
+    document.getElementById("pushToggleButton").addEventListener("click", async () => {
+      if (!profile) return openAuth("mypage");
+      if (!pushSupported()) return;
+      const button = document.getElementById("pushToggleButton");
+      // 권한 요청은 클릭 직후 가장 먼저 호출해야 사파리 등에서 차단되지 않아요.
+      let permission = Notification.permission;
+      if (permission === "default") permission = await Notification.requestPermission();
+      button.disabled = true;
+      try {
+        const registration = await navigator.serviceWorker.register("/sw.js");
+        await navigator.serviceWorker.ready;
+        const existing = await registration.pushManager.getSubscription();
+        if (existing) {
+          await api("/api/push/unsubscribe", { method: "POST", body: JSON.stringify({ endpoint: existing.endpoint }) });
+          await existing.unsubscribe();
+          pushSyncedUserId = null;
+          showToast("이 기기의 푸시 알림을 껐어요.");
+        } else {
+          if (permission !== "granted") throw new Error("알림 권한이 허용되지 않았어요.");
+          const keyInfo = await api("/api/push/public-key");
+          if (!keyInfo.enabled) throw new Error("서버에 푸시 알림이 아직 설정되지 않았어요.");
+          const subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(keyInfo.publicKey) });
+          await api("/api/push/subscribe", { method: "POST", body: JSON.stringify({ subscription: subscription.toJSON() }) });
+          pushSyncedUserId = profile.id;
+          showToast("이 기기로 새 메시지 알림을 보내드릴게요.");
+        }
+      } catch (error) {
+        showToast(error.message || "알림 설정에 실패했어요.");
+      }
+      button.disabled = false;
+      updatePushUi();
+    });
+
     setSection("sale");
     async function initializeApp() {
       try {
@@ -1556,12 +1793,23 @@
         profile = session.user;
         if (profile) settings = await api("/api/settings");
         await refreshServerData();
+        if ("serviceWorker" in navigator) {
+          navigator.serviceWorker.register("/sw.js").catch(() => {});
+          navigator.serviceWorker.addEventListener("message", (event) => {
+            if (event.data?.type === "open-mypage" && profile) { setSection("mypage"); refreshUnreadState(); }
+          });
+        }
+        if (profile && new URLSearchParams(location.search).get("open") === "mypage") {
+          setSection("mypage");
+          history.replaceState(null, "", "/");
+        }
       } catch (error) {
         showToast(`서버에 연결할 수 없어요. ${error.message}`);
       }
       chatPollTimer = setInterval(async () => {
-        if (!profile) return;
+        if (!profile || document.hidden) return;
         await refreshActiveChat();
+        await pollNotifications();
         if (section === "mypage") {
           try {
             const [chatResponse, submissionResponse] = await Promise.all([api("/api/chats"), api("/api/photo-submissions")]);
