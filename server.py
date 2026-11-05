@@ -11,7 +11,7 @@ import sqlite3
 import time
 import shutil
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -139,6 +139,26 @@ def initialize_database() -> None:
                 published_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS messages_thread_idx ON messages(listing_id, id);
+            CREATE TABLE IF NOT EXISTS chat_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reporter_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                target_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                listing_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                snapshot TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'banned', 'dismissed')),
+                admin_note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                reviewed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS chat_reports_status_idx ON chat_reports(status, created_at);
+            CREATE TABLE IF NOT EXISTS user_bans (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                reason TEXT NOT NULL DEFAULT '',
+                banned_until TEXT,
+                created_at TEXT NOT NULL
+            );
             """
         )
         connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (int(time.time()),))
@@ -233,6 +253,31 @@ def decode_photo_data(data_url: object) -> tuple[bytes, str, str]:
     return image_bytes, mime_type, extension
 
 
+def get_active_ban(connection: sqlite3.Connection, user_id: int) -> sqlite3.Row | None:
+    ban = connection.execute("SELECT * FROM user_bans WHERE user_id = ?", (user_id,)).fetchone()
+    if ban is None:
+        return None
+    if ban["banned_until"] is None:
+        return ban
+    try:
+        until = datetime.fromisoformat(ban["banned_until"])
+    except ValueError:
+        return ban
+    if until > datetime.now(timezone.utc):
+        return ban
+    connection.execute("DELETE FROM user_bans WHERE user_id = ?", (user_id,))
+    return None
+
+
+def ban_message(ban: sqlite3.Row) -> str:
+    if ban["banned_until"] is None:
+        period = "영구 정지"
+    else:
+        period = f"{ban['banned_until'][:16].replace('T', ' ')} (UTC)까지 정지"
+    reason = f" 사유: {ban['reason']}" if ban["reason"] else ""
+    return f"정지된 계정입니다. ({period}){reason}"
+
+
 def create_session(connection: sqlite3.Connection, user_id: int) -> str:
     raw_token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw_token.encode("ascii")).digest()
@@ -253,6 +298,8 @@ class OpcaHandler(SimpleHTTPRequestHandler):
         print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}")
 
     def end_headers(self) -> None:
+        if self.path in {"/index.html", "/roster-data.js"}:
+            self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "same-origin")
         super().end_headers()
@@ -377,6 +424,45 @@ class OpcaHandler(SimpleHTTPRequestHandler):
                         item["submitter"] = row["nickname"]
                         item["imageUrl"] = f"/api/admin/photo-submissions/{item['id']}/image"
                         items.append(item)
+                    self.send_json(HTTPStatus.OK, {"items": items})
+                    return
+                if path == "/api/admin/chat-reports":
+                    self.require_admin(connection)
+                    rows = connection.execute(
+                        """SELECT r.*, reporter.nickname AS reporter_nickname, target.nickname AS target_nickname,
+                                  target.username AS target_username
+                           FROM chat_reports r
+                           JOIN users reporter ON reporter.id = r.reporter_id
+                           JOIN users target ON target.id = r.target_id
+                           WHERE r.status = 'pending' ORDER BY r.created_at ASC"""
+                    ).fetchall()
+                    items = []
+                    for row in rows:
+                        total = connection.execute("SELECT COUNT(*) FROM chat_reports WHERE target_id = ?", (row["target_id"],)).fetchone()[0]
+                        items.append({
+                            "id": row["id"],
+                            "reporter": row["reporter_nickname"],
+                            "target": row["target_nickname"],
+                            "targetId": row["target_id"],
+                            "listingId": row["listing_id"],
+                            "messageId": row["message_id"],
+                            "reason": row["reason"],
+                            "createdAt": row["created_at"],
+                            "totalReportsOnTarget": total,
+                            "chat": json.loads(row["snapshot"]),
+                        })
+                    self.send_json(HTTPStatus.OK, {"items": items})
+                    return
+                if path == "/api/admin/bans":
+                    self.require_admin(connection)
+                    rows = connection.execute(
+                        """SELECT user_bans.*, users.nickname FROM user_bans
+                           JOIN users ON users.id = user_bans.user_id ORDER BY user_bans.created_at DESC"""
+                    ).fetchall()
+                    items = [
+                        {"userId": r["user_id"], "nickname": r["nickname"], "reason": r["reason"], "bannedUntil": r["banned_until"], "createdAt": r["created_at"]}
+                        for r in rows if get_active_ban(connection, r["user_id"]) is not None
+                    ]
                     self.send_json(HTTPStatus.OK, {"items": items})
                     return
                 admin_image_match = re.fullmatch(r"/api/admin/photo-submissions/([a-f0-9]{32})/image", path)
@@ -566,6 +652,10 @@ class OpcaHandler(SimpleHTTPRequestHandler):
                     if not hmac.compare_digest(candidate, user["password_hash"]):
                         self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "아이디 또는 비밀번호를 확인해 주세요."})
                         return
+                    ban = get_active_ban(connection, user["id"])
+                    if ban is not None:
+                        self.send_json(HTTPStatus.FORBIDDEN, {"error": ban_message(ban)})
+                        return
                     token = create_session(connection, user["id"])
                     self.send_json(HTTPStatus.OK, {"user": self.public_user(user)}, [self.session_cookie(token)])
                     return
@@ -675,8 +765,96 @@ class OpcaHandler(SimpleHTTPRequestHandler):
                         saved = True
                     self.send_json(HTTPStatus.OK, {"saved": saved})
                     return
+                if path.startswith("/api/chats/") and path.endswith("/report"):
+                    user = self.require_user(connection)
+                    listing_id = path.removeprefix("/api/chats/").removesuffix("/report").strip("/")
+                    self.authorize_thread(connection, user["id"], listing_id, allow_start=False)
+                    try:
+                        message_id = int(body.get("messageId"))
+                    except (TypeError, ValueError):
+                        raise ValueError("신고할 메시지를 확인할 수 없습니다.")
+                    reason = str(body.get("reason", "")).strip()
+                    if not reason or len(reason) > 500:
+                        raise ValueError("신고 사유를 1~500자로 입력해 주세요.")
+                    target_message = connection.execute(
+                        "SELECT * FROM messages WHERE id = ? AND listing_id = ? AND (sender_id = ? OR recipient_id = ?)",
+                        (message_id, listing_id, user["id"], user["id"]),
+                    ).fetchone()
+                    if target_message is None:
+                        raise ValueError("신고할 메시지를 찾을 수 없습니다.")
+                    if target_message["sender_id"] == user["id"]:
+                        raise ValueError("내 메시지는 신고할 수 없습니다.")
+                    target_id = target_message["sender_id"]
+                    if connection.execute(
+                        "SELECT 1 FROM chat_reports WHERE reporter_id = ? AND target_id = ? AND listing_id = ? AND status = 'pending'",
+                        (user["id"], target_id, listing_id),
+                    ).fetchone():
+                        raise ValueError("이미 신고가 접수되어 검토 중입니다.")
+                    history = connection.execute(
+                        """SELECT messages.id, messages.sender_id, messages.body, messages.created_at, users.nickname
+                           FROM messages JOIN users ON users.id = messages.sender_id
+                           WHERE messages.listing_id = ?
+                             AND ((messages.sender_id = ? AND messages.recipient_id = ?) OR (messages.sender_id = ? AND messages.recipient_id = ?))
+                           ORDER BY messages.id DESC LIMIT 50""",
+                        (listing_id, user["id"], target_id, target_id, user["id"]),
+                    ).fetchall()
+                    snapshot = [
+                        {"id": h["id"], "senderId": h["sender_id"], "nickname": h["nickname"], "body": h["body"], "createdAt": h["created_at"]}
+                        for h in reversed(history)
+                    ]
+                    connection.execute(
+                        """INSERT INTO chat_reports(reporter_id, target_id, listing_id, message_id, reason, snapshot, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (user["id"], target_id, listing_id, message_id, reason, json.dumps(snapshot, ensure_ascii=False), now_iso()),
+                    )
+                    self.send_json(HTTPStatus.CREATED, {"ok": True})
+                    return
+                report_review_match = re.fullmatch(r"/api/admin/chat-reports/(\d+)/review", path)
+                if report_review_match:
+                    admin = self.require_admin(connection)
+                    report = connection.execute("SELECT * FROM chat_reports WHERE id = ?", (int(report_review_match.group(1)),)).fetchone()
+                    if report is None or report["status"] != "pending":
+                        self.send_json(HTTPStatus.NOT_FOUND, {"error": "검토 대기 중인 신고를 찾을 수 없습니다."})
+                        return
+                    decision = body.get("decision")
+                    note = str(body.get("note", "")).strip()[:500]
+                    if decision not in {"ban", "dismiss"}:
+                        raise ValueError("정지 또는 기각을 선택해 주세요.")
+                    if decision == "ban":
+                        target = connection.execute("SELECT * FROM users WHERE id = ?", (report["target_id"],)).fetchone()
+                        if target is None or target["id"] == admin["id"] or target["username"].casefold() == ADMIN_USERNAME:
+                            raise ValueError("이 계정은 정지할 수 없습니다.")
+                        days = int(body.get("days", 0))
+                        if days < 0 or days > 3650:
+                            raise ValueError("정지 기간이 올바르지 않습니다.")
+                        banned_until = None if days == 0 else (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(timespec="seconds")
+                        connection.execute(
+                            """INSERT INTO user_bans(user_id, reason, banned_until, created_at) VALUES (?, ?, ?, ?)
+                               ON CONFLICT(user_id) DO UPDATE SET reason=excluded.reason, banned_until=excluded.banned_until, created_at=excluded.created_at""",
+                            (target["id"], note or report["reason"], banned_until, now_iso()),
+                        )
+                        connection.execute("DELETE FROM sessions WHERE user_id = ?", (target["id"],))
+                        new_status = "banned"
+                    else:
+                        new_status = "dismissed"
+                    connection.execute(
+                        "UPDATE chat_reports SET status = ?, admin_note = ?, reviewed_at = ? WHERE id = ?",
+                        (new_status, note, now_iso(), report["id"]),
+                    )
+                    self.send_json(HTTPStatus.OK, {"id": report["id"], "status": new_status})
+                    return
+                unban_match = re.fullmatch(r"/api/admin/bans/(\d+)/unban", path)
+                if unban_match:
+                    self.require_admin(connection)
+                    connection.execute("DELETE FROM user_bans WHERE user_id = ?", (int(unban_match.group(1)),))
+                    self.send_json(HTTPStatus.OK, {"ok": True})
+                    return
                 if path.startswith("/api/chats/") and path.endswith("/messages"):
                     user = self.require_user(connection)
+                    ban = get_active_ban(connection, user["id"])
+                    if ban is not None:
+                        self.send_json(HTTPStatus.FORBIDDEN, {"error": ban_message(ban)})
+                        return
                     listing_id = path.removeprefix("/api/chats/").removesuffix("/messages").strip("/")
                     listing = self.authorize_thread(connection, user["id"], listing_id, allow_start=True)
                     message = str(body.get("body", "")).strip()

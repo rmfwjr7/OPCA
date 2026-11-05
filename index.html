@@ -159,6 +159,21 @@
     .chat-caption { margin: 0 auto 15px; text-align: center; color: #a1948b; font-size: 10px; }
     .message { width: fit-content; max-width: 78%; margin: 8px 0; padding: 9px 11px; border-radius: 11px 11px 11px 3px; background: white; font-size: 12px; line-height: 1.5; box-shadow: 0 1px 3px #31241a0a; }
     .message.mine { margin-left: auto; border-radius: 11px 11px 3px 11px; background: #ffe2d4; }
+    .message-name { display: block; margin-bottom: 3px; font-size: 10px; font-weight: 500; color: #a89c94; opacity: .85; }
+    .message-name.reportable { cursor: pointer; }
+    .message-name.reportable:hover { text-decoration: underline; opacity: 1; }
+    .nick-menu { position: fixed; z-index: 9999; padding: 4px; border: 1px solid var(--line); border-radius: 8px; background: white; box-shadow: 0 6px 18px #31241a26; }
+    .nick-menu button { display: block; width: 100%; padding: 9px 14px; border: 0; background: none; color: #d33; font-size: 12px; font-weight: 700; text-align: left; cursor: pointer; }
+    .nick-menu button:hover { background: #fff0f0; }
+    .admin-report-card { margin-top: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: white; font-size: 11px; line-height: 1.6; }
+    .admin-report-card details { margin: 8px 0; }
+    .admin-report-card summary { cursor: pointer; font-weight: 800; }
+    .report-chat-log { max-height: 180px; overflow-y: auto; margin-top: 6px; padding: 8px; border-radius: 8px; background: #fff8f4; }
+    .report-chat-log .is-target { background: #fff3cd; }
+    .report-chat-log small { color: #a89c94; }
+    .admin-report-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .admin-report-actions select, .admin-report-actions button { min-height: 32px; border: 1px solid var(--line); border-radius: 7px; padding: 0 9px; background: white; font-size: 10px; font-weight: 800; }
+    .admin-report-actions .ban-user { border-color: #d33; background: #d33; color: white; }
     .chat-compose { display: flex; gap: 8px; padding: 12px; }
     .chat-compose input { flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 7px; padding: 9px 10px; outline: 0; font-size: 12px; }
     .toast { position: fixed; z-index: 80; left: 50%; bottom: 25px; transform: translate(-50%, 20px); opacity: 0; pointer-events: none; border-radius: 8px; padding: 11px 16px; background: #302923; color: white; font-size: 12px; box-shadow: 0 8px 24px #0002; transition: .2s; }
@@ -674,6 +689,13 @@
         <div id="adminPhotoQueue"></div>
         <div class="mypage-empty" id="adminPhotoEmpty">검토할 사진 제보가 없어요.</div>
       </section>
+      <section class="mypage-section" id="adminReportSection" hidden>
+        <div class="mypage-section-title-row"><h2 class="mypage-heading">채팅 신고 대기</h2><span class="result-count" id="adminReportCount">0개</span></div>
+        <div id="adminReportQueue"></div>
+        <div class="mypage-empty" id="adminReportEmpty">처리할 신고가 없어요.</div>
+        <div class="mypage-section-title-row" style="margin-top:18px"><h2 class="mypage-heading">정지된 계정</h2><span class="result-count" id="adminBanCount">0개</span></div>
+        <div id="adminBanList"></div>
+      </section>
       <section class="mypage-section"><button class="backup-action" id="downloadBackupButton">내 매물 백업 다운로드</button></section>
       <section class="mypage-section"><button class="backup-action" id="logoutButton">로그아웃</button></section>
     </section>
@@ -765,6 +787,8 @@
     let cardImages = [];
     let myPhotoSubmissions = [];
     let adminPhotoSubmissions = [];
+    let adminChatReports = [];
+    let adminBans = [];
     let profile = null;
     let settings = { chatNotifications: true, favoriteNotifications: false };
     let section = "sale";
@@ -806,6 +830,7 @@
       document.getElementById("logoutButton").style.display = profile ? "" : "none";
       document.getElementById("photoSuggestionSection").style.display = profile ? "" : "none";
       document.getElementById("adminPhotoSection").hidden = !profile?.isAdmin;
+      document.getElementById("adminReportSection").hidden = !profile?.isAdmin;
       updateAccountButton();
     }
     async function refreshServerData() {
@@ -822,16 +847,20 @@
         chats = chatsResponse.items;
         myPhotoSubmissions = photoResponse.items;
         adminPhotoSubmissions = profile.isAdmin ? (await api("/api/admin/photo-submissions")).items : [];
+        await loadAdminModeration();
       } else {
         favorites = [];
         chats = [];
         myPhotoSubmissions = [];
         adminPhotoSubmissions = [];
+        adminChatReports = [];
+        adminBans = [];
         settings = { chatNotifications: true, favoriteNotifications: false };
       }
       updateProfilePanel();
       renderPhotoSubmissions();
       renderAdminPhotoQueue();
+      renderAdminModeration();
       render();
       renderChatList();
     }
@@ -1009,6 +1038,39 @@
         const cardName = metadata.cardType === "기타" ? metadata.title : metadata.player;
         return `<div class="submission-row"><span>${escapeHtml(metadata.year)} · ${escapeHtml(metadata.stage)} · ${escapeHtml(metadata.team)} · ${escapeHtml(cardName)}</span><span class="submission-status">${labels[submission.status] || submission.status}${submission.reviewerNote ? ` · ${escapeHtml(submission.reviewerNote)}` : ""}</span></div>`;
       }).join("");
+    }
+    async function loadAdminModeration() {
+      if (!profile?.isAdmin) { adminChatReports = []; adminBans = []; return; }
+      const [reportResponse, banResponse] = await Promise.all([api("/api/admin/chat-reports"), api("/api/admin/bans")]);
+      adminChatReports = reportResponse.items;
+      adminBans = banResponse.items;
+    }
+    function formatBanUntil(value) {
+      return value ? `${value.slice(0, 16).replace("T", " ")} (UTC)까지` : "영구";
+    }
+    function renderAdminModeration() {
+      const queue = document.getElementById("adminReportQueue");
+      if (!queue) return;
+      document.getElementById("adminReportCount").textContent = `${adminChatReports.length}개`;
+      document.getElementById("adminReportEmpty").style.display = adminChatReports.length ? "none" : "block";
+      document.getElementById("adminBanCount").textContent = `${adminBans.length}개`;
+      // 관리자가 로그를 펼쳐 보는 중이면 4초마다 갱신돼도 닫히지 않도록 열린 상태를 기억합니다.
+      const openIds = new Set([...queue.querySelectorAll("details[open]")].map((el) => el.dataset.reportId));
+      queue.innerHTML = adminChatReports.map((report) => {
+        const log = report.chat.map((m) => `<div class="${m.senderId === report.targetId ? "is-target" : ""}"><small>${escapeHtml(m.nickname)} · ${escapeHtml(m.createdAt.slice(5, 16).replace("T", " "))}</small><br>${escapeHtml(m.body)}</div>`).join("");
+        return `<article class="admin-report-card">
+          <strong>${escapeHtml(report.target)}</strong> 님 신고 <small>(누적 ${report.totalReportsOnTarget}건)</small><br>
+          신고자 ${escapeHtml(report.reporter)} · ${escapeHtml(report.createdAt.slice(0, 16).replace("T", " "))}<br>
+          사유: ${escapeHtml(report.reason)}
+          <details data-report-id="${report.id}" ${openIds.has(String(report.id)) ? "open" : ""}><summary>채팅 내역 보기 (${report.chat.length}개, 노란 줄 = 신고 대상)</summary><div class="report-chat-log">${log}</div></details>
+          <div class="admin-report-actions">
+            <select data-report-days="${report.id}"><option value="1">1일</option><option value="3">3일</option><option value="7" selected>7일</option><option value="30">30일</option><option value="0">영구</option></select>
+            <button class="ban-user" data-report-action="ban" data-report-id="${report.id}">정지</button>
+            <button data-report-action="dismiss" data-report-id="${report.id}">기각</button>
+          </div>
+        </article>`;
+      }).join("");
+      document.getElementById("adminBanList").innerHTML = adminBans.map((ban) => `<div class="admin-report-card"><strong>${escapeHtml(ban.nickname)}</strong> · ${escapeHtml(formatBanUntil(ban.bannedUntil))}<br>사유: ${escapeHtml(ban.reason || "-")}<div class="admin-report-actions"><button data-unban="${ban.userId}">정지 해제</button></div></div>`).join("") || `<div class="mypage-empty" style="display:block">정지된 계정이 없어요.</div>`;
     }
     function renderAdminPhotoQueue() {
       const queue = document.getElementById("adminPhotoQueue");
@@ -1206,6 +1268,40 @@
         showToast(error.message);
       }
     });
+    document.getElementById("adminReportSection").addEventListener("click", async (event) => {
+      if (!profile?.isAdmin) return;
+      const actionButton = event.target.closest("[data-report-action]");
+      const unbanButton = event.target.closest("[data-unban]");
+      try {
+        if (actionButton) {
+          const id = actionButton.dataset.reportId;
+          const decision = actionButton.dataset.reportAction;
+          let note = "";
+          let days = 0;
+          if (decision === "ban") {
+            days = Number(document.querySelector(`[data-report-days="${id}"]`).value);
+            note = prompt("정지 사유를 입력해 주세요. 정지된 사용자에게 표시돼요. (비워두면 신고 사유가 사용돼요)") ?? null;
+            if (note === null) return;
+            if (!confirm(`정말 ${days === 0 ? "영구" : days + "일"} 정지할까요?`)) return;
+          }
+          actionButton.disabled = true;
+          await api(`/api/admin/chat-reports/${encodeURIComponent(id)}/review`, { method: "POST", body: JSON.stringify({ decision, days, note }) });
+          await loadAdminModeration();
+          renderAdminModeration();
+          showToast(decision === "ban" ? "계정을 정지했어요." : "신고를 기각했어요.");
+        } else if (unbanButton) {
+          if (!confirm("정지를 해제할까요?")) return;
+          await api(`/api/admin/bans/${encodeURIComponent(unbanButton.dataset.unban)}/unban`, { method: "POST", body: JSON.stringify({}) });
+          await loadAdminModeration();
+          renderAdminModeration();
+          showToast("정지를 해제했어요.");
+        }
+      } catch (error) {
+        showToast(error.message);
+        await loadAdminModeration().catch(() => {});
+        renderAdminModeration();
+      }
+    });
     document.querySelectorAll(".listing-tab").forEach((button) => button.addEventListener("click", () => {
       listingKind = button.dataset.kind;
       document.querySelectorAll(".listing-tab").forEach((tab) => tab.classList.toggle("active", tab === button));
@@ -1335,9 +1431,35 @@
     function renderMessages(items) {
       const history = document.getElementById("chatHistory");
       const caption = `<p class="chat-caption">거래 조건과 포카 상태를 충분히 확인해 주세요.</p>`;
-      history.innerHTML = caption + items.map((message) => `<div class="message ${profile && message.senderId === profile.id ? "mine" : ""}"><span class="message-name">${escapeHtml(message.senderNickname)}</span><br>${escapeHtml(message.body)}</div>`).join("");
+      history.innerHTML = caption + items.map((message) => `<div class="message ${profile && message.senderId === profile.id ? "mine" : ""}"><span class="message-name ${profile && message.senderId !== profile.id ? "reportable" : ""}" ${profile && message.senderId !== profile.id ? `data-report-message="${message.id}" data-report-nickname="${escapeHtml(message.senderNickname)}"` : ""}>${escapeHtml(message.senderNickname)}</span>${escapeHtml(message.body)}</div>`).join("");
       history.scrollTop = history.scrollHeight;
     }
+    function closeNickMenu() { document.querySelectorAll(".nick-menu").forEach((menu) => menu.remove()); }
+    document.getElementById("chatHistory").addEventListener("click", (event) => {
+      const name = event.target.closest("[data-report-message]");
+      if (!name) return;
+      event.stopPropagation();
+      closeNickMenu();
+      const menu = document.createElement("div");
+      menu.className = "nick-menu";
+      menu.innerHTML = `<button type="button">🚨 신고하기</button>`;
+      const rect = name.getBoundingClientRect();
+      menu.style.left = `${Math.min(rect.left, window.innerWidth - 140)}px`;
+      menu.style.top = `${rect.bottom + 4}px`;
+      menu.querySelector("button").addEventListener("click", async () => {
+        closeNickMenu();
+        const reason = prompt(`"${name.dataset.reportNickname}" 님을 신고하는 사유를 적어주세요.`);
+        if (!reason || !reason.trim()) return;
+        try {
+          await api(`/api/chats/${encodeURIComponent(activeChatListingId)}/report`, { method: "POST", body: JSON.stringify({ messageId: Number(name.dataset.reportMessage), reason: reason.trim() }) });
+          showToast("신고가 접수되었어요. 관리자가 확인할 예정이에요.");
+        } catch (error) {
+          showToast(error.message);
+        }
+      });
+      document.body.appendChild(menu);
+      setTimeout(() => document.addEventListener("click", closeNickMenu, { once: true }), 0);
+    });
     async function refreshActiveChat() {
       if (!profile || !activeChatListingId || !document.getElementById("chatOverlay").classList.contains("open")) return;
       try {
@@ -1445,10 +1567,11 @@
             const [chatResponse, submissionResponse] = await Promise.all([api("/api/chats"), api("/api/photo-submissions")]);
             chats = chatResponse.items;
             myPhotoSubmissions = submissionResponse.items;
-            if (profile.isAdmin) adminPhotoSubmissions = (await api("/api/admin/photo-submissions")).items;
+            if (profile.isAdmin) { adminPhotoSubmissions = (await api("/api/admin/photo-submissions")).items; await loadAdminModeration(); }
             renderChatList();
             renderPhotoSubmissions();
             renderAdminPhotoQueue();
+            renderAdminModeration();
           } catch { /* The next polling cycle will retry. */ }
         }
       }, 4000);
